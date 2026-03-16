@@ -1,3 +1,7 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
 """
 plan_questions.py
 
@@ -501,6 +505,7 @@ def get_state():
         # Print question header
         print(f"\n[{i}] {question}")
         print(f"    → {answer}")
+        print("-" * 120)
     print()
 
 
