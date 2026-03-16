@@ -504,9 +504,102 @@ def get_state():
     print()
 
 
+def run_all(max_rounds: int = 5):
+    """
+    Full end-to-end orchestration:
+
+    1. Build (or load) the metadata store via summarize_documents.
+    2. Build (or load) the question plan by downloading questions and calling Gemini.
+    3. Loop up to `max_rounds` times, calling goDeep for every unanswered question.
+       Stops early once every question has an answer_found.
+    """
+    import summarize_documents as sd
+
+    # ── Step 1: Metadata store ───────────────────────────────────────────────
+    csv_path = Path(__file__).parent / "metadata_store.csv"
+    db_path  = sd.DB_PATH
+
+    if csv_path.exists() or db_path.exists():
+        print("✓ Metadata store already exists — loading.")
+        metadata = get_metadata_store()
+        print(f"  {len(metadata)} documents loaded.\n")
+    else:
+        print("▶ Metadata store not found — running summarize_documents...\n")
+        sd.main()
+        metadata = get_metadata_store()
+        print(f"\n✓ Metadata store built: {len(metadata)} documents.\n")
+
+    # ── Step 2: Question plan ────────────────────────────────────────────────
+    if OUT_PATH.exists():
+        print("✓ Question plan already exists — loading.")
+        plans = json.loads(OUT_PATH.read_text())
+        print(f"  {len(plans)} questions loaded.\n")
+    else:
+        print("▶ Question plan not found — downloading questions and planning...\n")
+        questions = download_questions()
+        plans = build_plan_with_gemini(questions, metadata)
+        OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        OUT_PATH.write_text(json.dumps(plans, indent=2, ensure_ascii=False))
+        print(f"\n✓ Question plan written: {len(plans)} questions.\n")
+
+    # ── Step 3: Deep-dive loop ───────────────────────────────────────────────
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    gcs_client    = storage.Client()
+    print("Building GCS blob index...")
+    gcs_blob_map  = _build_gcs_blob_map(gcs_client)
+    print(f"  {len(gcs_blob_map)} documents indexed.\n")
+
+    for round_num in range(1, max_rounds + 1):
+        # Re-read plans from disk so each round picks up any mutations
+        plans = json.loads(OUT_PATH.read_text())
+
+        unanswered = [i for i, p in enumerate(plans) if not p.get("answer_found")]
+        if not unanswered:
+            print(f"✓ All {len(plans)} questions answered — stopping after round {round_num - 1}.")
+            break
+
+        print(f"{'='*60}")
+        print(f"  ROUND {round_num}/{max_rounds}  —  {len(unanswered)} unanswered question(s)")
+        print(f"{'='*60}\n")
+
+        for i in unanswered:
+            q_num = i + 1
+            print(f"── Q{q_num}: {plans[i].get('question', '')[:70]}")
+            result_json = goDeep(
+                question_number=q_num,
+                plans=plans,
+                gcs_blob_map=gcs_blob_map,
+                gemini_client=gemini_client,
+            )
+            plans[i] = json.loads(result_json)
+            OUT_PATH.write_text(json.dumps(plans, indent=2, ensure_ascii=False))
+            print()
+
+        # Check again after the round
+        still_unanswered = [i for i, p in enumerate(plans) if not p.get("answer_found")]
+        answered_count   = len(plans) - len(still_unanswered)
+        print(f"\nAfter round {round_num}: {answered_count}/{len(plans)} answered.\n")
+
+        if not still_unanswered:
+            print("✓ All questions answered!")
+            break
+    else:
+        remaining = [p.get("question", "") for p in plans if not p.get("answer_found")]
+        print(f"\n⚠  Max rounds ({max_rounds}) reached. {len(remaining)} question(s) still unanswered:")
+        for q in remaining:
+            print(f"   - {q}")
+
+    # ── Final state ──────────────────────────────────────────────────────────
+    print()
+    get_state()
+
+
+
 if __name__ == "__main__":
     import sys
-    if "--deep" in sys.argv:
+    if "--runAll" in sys.argv:
+        run_all()
+    elif "--deep" in sys.argv:
         run_deep_dive()
     elif "--getState" in sys.argv:
         get_state()
