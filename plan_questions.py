@@ -114,6 +114,16 @@ Each element must have exactly these three keys:
                    Only include documents that are genuinely relevant.
                    If "answer_found" is not null, set "plan" to [].
 
+CRITICAL — Evidential completeness:
+  Before finalising a plan, think through what a correct answer would need to assert.
+  For every factual sub-claim the answer would rely on (a number, a threshold, a name,
+  a date, a monetary value, a legal condition), ask: is there a document in the library
+  that could confirm or refute that claim directly?
+  If yes, that document MUST appear in the plan with an instruction to verify that
+  specific sub-claim — even if it seems tangential to the main question.
+  Do NOT rely on assumptions or general knowledge for any sub-claim that a corpus
+  document could resolve.
+
 Return a JSON array, one object per question, in the same order as the questions above.
 No extra keys. No markdown. No explanation outside the JSON."""
 
@@ -233,6 +243,12 @@ def _evaluate_answer(gemini_client, question: str,
         f"Rules:\n"
         f"- 'Adequate' means a reader could act on this answer without needing to look further.\n"
         f"- If there is genuinely no relevant information above, answer is NOT sufficient.\n"
+        f"- EVIDENTIAL COMPLETENESS CHECK: Identify every factual sub-claim the answer "
+        f"makes (numbers, thresholds, values, names, dates, legal conditions). "
+        f"If any such claim uses hedging language (likely, probably, approximately, may, "
+        f"might, unclear, assumed) AND that claim is pivotal to the conclusion, the answer "
+        f"is NOT sufficient — even if the overall logic is sound. "
+        f"The 'reason' must name the specific unverified claim.\n"
         f"- Respond with ONLY valid JSON (no markdown fences), exactly this shape:\n"
         f'{{"sufficient": true/false, "reason": "...", "synthesised_answer": "..."}}\n'
         f"- If sufficient=true, write a clean, concise answer in 'synthesised_answer' "
@@ -275,12 +291,20 @@ def _refine_plan(gemini_client, question: str, existing_plan: list[dict],
         f"=== END ===\n\n"
         f"=== FULL DOCUMENT LIBRARY (metadata) ===\n{metadata_text}\n=== END ===\n\n"
         f"The data found so far is NOT sufficient to answer the question.\n"
-        f"Your task: produce a revised research plan that fills the gaps.\n"
-        f"You MAY:\n"
-        f"  - Add entries for documents that haven't been queried yet.\n"
-        f"  - Re-add already-queried documents if you need to look for DIFFERENT "
-        f"information than before (use a clearly different search target).\n"
-        f"Do NOT simply repeat the same search targets that already failed.\n\n"
+        f"Your task: produce a revised research plan that fills the gaps.\n\n"
+        f"Step 1 — Identify unverified sub-claims:\n"
+        f"  Read through the data extracted so far. Find every factual assertion that "
+        f"uses hedging language (likely, probably, approximately, may, might, assumed, "
+        f"unclear) or that is stated without a direct document citation. "
+        f"List these as the claims that MUST be verified before the question can be closed.\n\n"
+        f"Step 2 — Map each unverified claim to a document:\n"
+        f"  For each unverified claim, check the document library above. "
+        f"If any document could plausibly contain the definitive value or fact, "
+        f"add it to the plan with an instruction to find that specific piece of evidence.\n\n"
+        f"Step 3 — Add any other missing coverage:\n"
+        f"  You MAY also add entries for documents that haven't been queried yet "
+        f"if they are relevant, or re-add already-queried documents with a DIFFERENT "
+        f"search target. Do NOT repeat search targets that already failed.\n\n"
         f"Return ONLY a valid JSON array (no markdown fences) of plan items:\n"
         f"[{{\"<document_name>\": \"what specifically to look for\"}}, ...]\n"
         f"List only the NEW items to execute — do not re-list items already covered above."
