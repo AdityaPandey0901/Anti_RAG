@@ -297,6 +297,45 @@ def _refine_plan(gemini_client, question: str, existing_plan: list[dict],
     return json.loads(raw)
 
 
+def _answer_directly_from_doc(gemini_client, doc_name: str,
+                              blob_bytes: bytes, question: str) -> str:
+    """Upload the full document to Gemini and ask it to answer the question directly."""
+    ext  = Path(doc_name).suffix.lower()
+    mime = _NATIVE_MIME.get(ext)
+
+    prompt = (
+        f"You are a precise legal and financial research assistant.\n\n"
+        f"Please answer the following question as completely and accurately as possible "
+        f"using the content of this document (\"{doc_name}\"):\n\n"
+        f"QUESTION: \"{question}\"\n\n"
+        f"Instructions:\n"
+        f"1. Search the entire document for any information relevant to the question.\n"
+        f"2. Provide a direct, concise answer.\n"
+        f"3. Support your answer with exact quoted passages and citations "
+        f"([{doc_name}, Page <N>]).\n"
+        f"4. If the document does not contain the answer, state clearly: "
+        f"NOT FOUND IN THIS DOCUMENT: <reason>."
+    )
+
+    if mime:
+        part     = types.Part.from_bytes(data=blob_bytes, mime_type=mime)
+        contents = [part, prompt]
+    else:
+        if ext == ".docx":
+            text, _ = extract_docx_text(blob_bytes)
+        elif ext in (".xlsx", ".xls"):
+            text, _ = extract_excel_text(blob_bytes, ext)
+        else:
+            return f"NOT FOUND: unsupported file type {ext}"
+        contents = [f"DOCUMENT CONTENTS ({doc_name}):\n{text}\n\nQUESTION:\n{prompt}"]
+
+    response = gemini_client.models.generate_content(
+        model=MODEL_NAME,
+        contents=contents,
+    )
+    return response.text.strip()
+
+
 def goDeep(question_number: int,
            plans: list[dict]=None,
            gcs_blob_map: dict=None ,
@@ -427,6 +466,66 @@ def goDeep(question_number: int,
         data_found.append(result)
         # Write progress after every document so interruptions don't lose work
         entry["data_found"] = data_found
+        plans[idx] = entry
+        OUT_PATH.write_text(json.dumps(plans, indent=2, ensure_ascii=False))
+
+    # ── Case 4: plan fully executed — try synthesis, then direct fallback ────
+    final_verdict = _evaluate_answer(gemini_client, question, None, data_found)
+    if final_verdict["sufficient"]:
+        print(f"    Post-execution synthesis succeeded.")
+        entry["answer_found"] = final_verdict["synthesised_answer"]
+        plans[idx] = entry
+        OUT_PATH.write_text(json.dumps(plans, indent=2, ensure_ascii=False))
+        return json.dumps(entry, indent=2, ensure_ascii=False)
+
+    # Synthesis failed — check if refining the plan would add anything new
+    print(f"    Synthesis after plan execution insufficient — checking if plan can be refined...")
+    metadata      = get_metadata_store()
+    refined_items = _refine_plan(gemini_client, question, plan, data_found, metadata)
+
+    if refined_items:
+        # There are genuinely new things to look at — record them for the next round
+        print(f"    {len(refined_items)} new plan item(s) found — deferring to next round.")
+        entry["plan"] = plan + refined_items
+        plans[idx]    = entry
+        OUT_PATH.write_text(json.dumps(plans, indent=2, ensure_ascii=False))
+    else:
+        # Plan wouldn't change — go direct: upload each document and ask outright
+        print(f"    Plan unchanged — falling back to direct document answer...")
+        direct_answers = []
+        for plan_item in plan:
+            doc_name = next(iter(plan_item))
+            blob     = gcs_blob_map.get(doc_name)
+            if blob is None:
+                direct_answers.append(f"NOT IN BUCKET: {doc_name}")
+                continue
+            print(f"      Direct query: {doc_name} ...", end=" ", flush=True)
+            try:
+                blob_bytes_d = blob.download_as_bytes()
+                ans = _answer_directly_from_doc(
+                    gemini_client, doc_name, blob_bytes_d, question
+                )
+                direct_answers.append(f"[Direct — {doc_name}]\n{ans}")
+                print("OK")
+            except Exception as e:
+                direct_answers.append(f"ERROR ({doc_name}): {e}")
+                print(f"ERROR: {e}")
+
+        # Synthesise a final answer from all direct responses
+        combined_verdict = _evaluate_answer(
+            gemini_client, question, None, direct_answers
+        )
+        if combined_verdict["sufficient"]:
+            entry["answer_found"] = combined_verdict["synthesised_answer"]
+        else:
+            # Last resort: store the best direct answer we got
+            best = next(
+                (a for a in direct_answers if not a.startswith("NOT") and not a.startswith("ERROR")),
+                direct_answers[0] if direct_answers else "No answer could be determined."
+            )
+            entry["answer_found"] = best
+
+        entry["data_found"] = data_found + direct_answers
         plans[idx] = entry
         OUT_PATH.write_text(json.dumps(plans, indent=2, ensure_ascii=False))
 
