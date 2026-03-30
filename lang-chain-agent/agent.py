@@ -130,7 +130,7 @@ def _build_agent(llm: ChatGoogleGenerativeAI):
     """Build a LangChain agent with all currently available tools."""
     all_tools = _get_all_tools()
     return create_agent(
-        model=llm,s
+        model=llm,
         tools=all_tools,
         system_prompt=SYSTEM_PROMPT,
     )
