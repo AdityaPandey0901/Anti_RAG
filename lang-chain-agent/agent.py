@@ -1,14 +1,15 @@
 """
 Core agent loop for the LangChain agent.
 
-Uses LangGraph's ReAct agent with ChatVertexAI (Gemini) as the LLM,
-LangChain tools for the pipeline, and LangSmith for full observability.
+Uses LangGraph's ReAct agent with ChatGoogleGenerativeAI (Gemini API) as the
+LLM, LangChain tools for the pipeline, and LangSmith for full observability.
 
 Key differences from the pi-agent:
   • Tools are LangChain @tool-decorated functions (auto-schema).
   • The agent loop is managed by LangGraph (ReAct pattern).
   • Every step is traced to LangSmith automatically.
   • Dynamic tools are injected each turn by rebuilding the agent.
+  • Uses the Gemini API directly (no Vertex AI service account needed).
 """
 
 from __future__ import annotations
@@ -16,11 +17,11 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from langchain_google_vertexai import ChatVertexAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 
-from config import MODEL_NAME, VERTEX_PROJECT, VERTEX_LOCATION, MAX_ROUNDS
+from config import MODEL_NAME, GEMINI_API_KEY, MAX_ROUNDS
 from tools import PIPELINE_TOOLS
 from tool_forge import META_TOOLS, get_dynamic_lc_tools
 
@@ -110,12 +111,11 @@ Always check state before and after major actions. Be methodical."""
 # AGENT CONSTRUCTION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _build_llm() -> ChatVertexAI:
-    """Create the Gemini LLM via Vertex AI."""
-    return ChatVertexAI(
-        model_name=MODEL_NAME,
-        project=VERTEX_PROJECT,
-        location=VERTEX_LOCATION,
+def _build_llm() -> ChatGoogleGenerativeAI:
+    """Create the Gemini LLM via the Google Generative AI API (API key)."""
+    return ChatGoogleGenerativeAI(
+        model=MODEL_NAME,
+        google_api_key=GEMINI_API_KEY,
         temperature=0.0,
         max_retries=3,
     )
@@ -126,13 +126,13 @@ def _get_all_tools() -> list:
     return PIPELINE_TOOLS + META_TOOLS + get_dynamic_lc_tools()
 
 
-def _build_agent(llm: ChatVertexAI):
-    """Build a LangGraph ReAct agent with all currently available tools."""
+def _build_agent(llm: ChatGoogleGenerativeAI):
+    """Build a LangChain agent with all currently available tools."""
     all_tools = _get_all_tools()
-    return create_react_agent(
-        model=llm,
+    return create_agent(
+        model=llm,s
         tools=all_tools,
-        prompt=SystemMessage(content=SYSTEM_PROMPT),
+        system_prompt=SYSTEM_PROMPT,
     )
 
 
