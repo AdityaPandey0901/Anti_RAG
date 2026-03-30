@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-CLI entry point for the pi-agent.
+CLI entry point for the LangChain PI-Agent.
 
 Usage:
     python run.py                        # Run full pipeline (default)
     python run.py --state                # Print current pipeline state
     python run.py --report               # Print final Q&A report
+    python run.py --tool-audit           # Print tool creation audit log
     python run.py --ask "your question"  # Send a custom instruction to the agent
     python run.py --quiet                # Suppress verbose output
 """
@@ -15,17 +16,18 @@ from __future__ import annotations
 import argparse
 import sys
 
-# Ensure the pi-agent package directory is on the path for config/tools/etc.
+# Ensure the lang-chain-agent package directory is on the path
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from agent import run_agent
-from tools import check_pipeline_state, get_final_report, get_tool_audit_log
+from tools import check_pipeline_state, get_final_report
+from tool_forge import get_tool_audit_log
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="pi-agent — Pipeline Intelligence agent for document research.",
+        description="LangChain PI-Agent — Pipeline Intelligence agent with LangSmith observability.",
     )
     parser.add_argument(
         "--state", action="store_true",
@@ -54,15 +56,15 @@ def main():
     args = parser.parse_args()
 
     if args.state:
-        print(check_pipeline_state())
+        print(check_pipeline_state.invoke({}))
         return
 
     if args.report:
-        print(get_final_report())
+        print(get_final_report.invoke({}))
         return
 
     if args.tool_audit:
-        print(get_tool_audit_log())
+        print(get_tool_audit_log.invoke({}))
         return
 
     user_msg = args.ask or "Run the full research pipeline end-to-end."

@@ -1,4 +1,17 @@
+# Credentials & secrets
+.env
 cciscrape-d55fa0df8a7a.json
-.env
-.env
 cciscrape-1d50a9ea47ef.json
+
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Agent outputs
+pi-agent/output/
+lang-chain-agent/output/
+

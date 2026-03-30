@@ -1,10 +1,9 @@
 """
-Tools that the pi-agent can invoke via Gemini function calling.
+Tools for the LangChain agent.
 
-Each public function in this module is registered as a tool the agent can
-call.  They wrap the heavy lifting already implemented in the parent
-project (summarize_documents, plan_questions) so the agent only needs to
-reason about *what* to do — not *how*.
+Each function is decorated with @tool so LangChain automatically generates
+the schema and makes it available to the agent.  The heavy lifting is
+identical to the pi-agent implementation.
 """
 
 from __future__ import annotations
@@ -19,9 +18,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 from google.cloud import storage
 from google import genai
-from google.genai import types
+from google.genai import types as genai_types
+from langchain_core.tools import tool
 
-# ── Extraction helpers (inlined from summarize_documents) ────────────────────
+# ── Extraction helpers ───────────────────────────────────────────────────────
 import fitz          # PyMuPDF
 import pytesseract
 from PIL import Image
@@ -36,7 +36,11 @@ from config import (
 )
 import state as st
 
-# ── Shared clients (lazy-initialised) ────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SHARED CLIENTS (lazy-initialised)
+# ═══════════════════════════════════════════════════════════════════════════════
+
 _gemini: genai.Client | None = None
 _gcs: storage.Client | None = None
 _blob_map: dict[str, object] | None = None
@@ -124,7 +128,7 @@ def extract_excel_text(blob_bytes: bytes, ext: str) -> tuple[str, str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TOOL 1: SUMMARISE DOCUMENTS
+# INTERNAL HELPERS (Gemini calls for summarise / plan / research)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _init_db() -> sqlite3.Connection:
@@ -164,81 +168,6 @@ def _summarize_with_gemini(client, doc_name: str, chunk: str) -> str:
     response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
     return response.text.strip()
 
-
-def summarise_documents() -> str:
-    """
-    Ingest every supported document from the GCS bucket, extract text,
-    and build the metadata store (SQLite + CSV) with Gemini-generated summaries.
-    Skips documents already processed. Returns a status string.
-    """
-    st.ensure_dirs()
-    conn = _init_db()
-    gcs = _get_gcs()
-    gemini = _get_gemini()
-
-    bucket = gcs.bucket(BUCKET_NAME)
-    blobs = list(bucket.list_blobs(prefix=PREFIX))
-
-    existing = {
-        r[0] for r in conn.execute("SELECT document_name FROM metadata_store").fetchall()
-    }
-
-    processed = 0
-    skipped = 0
-    errors = 0
-
-    for blob in blobs:
-        name = blob.name
-        if name.endswith("/"):
-            continue
-        ext = Path(name).suffix.lower()
-        doc_name = Path(name).name
-        if ext not in SUPPORTED_EXTENSIONS:
-            continue
-        if doc_name in existing:
-            skipped += 1
-            continue
-
-        try:
-            blob_bytes = blob.download_as_bytes()
-            if ext == ".pdf":
-                chunk, method = extract_pdf_text(blob_bytes)
-            elif ext == ".docx":
-                chunk, method = extract_docx_text(blob_bytes)
-            elif ext in (".xlsx", ".xls"):
-                chunk, method = extract_excel_text(blob_bytes, ext)
-            else:
-                continue
-
-            if not chunk:
-                _upsert_row(conn, doc_name, "[no content extracted]", method, "")
-                continue
-
-            summary = _summarize_with_gemini(gemini, doc_name, chunk)
-            _upsert_row(conn, doc_name, summary, method, chunk)
-            processed += 1
-        except Exception as e:
-            _upsert_row(conn, doc_name, f"[error: {e}]", "error", "")
-            errors += 1
-
-    # Export CSV
-    df = pd.read_sql_query(
-        "SELECT document_name, brief_summary, extraction_method FROM metadata_store", conn
-    )
-    conn.close()
-    CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(CSV_PATH, index=False)
-
-    total = len(df)
-    return (
-        f"Metadata store ready. {total} document(s) total — "
-        f"{processed} newly processed, {skipped} cached, {errors} error(s)."
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TOOL 2: DOWNLOAD & PLAN QUESTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def _download_questions() -> list[str]:
     client = _get_gcs()
@@ -296,42 +225,6 @@ Return a JSON array, one object per question, in the same order as the questions
 No extra keys. No markdown. No explanation outside the JSON."""
 
 
-def plan_questions() -> str:
-    """
-    Download the questions spreadsheet from GCS, load the metadata store,
-    and call Gemini to produce a structured research plan for every question.
-    Returns a status string.
-    """
-    st.ensure_dirs()
-    metadata = st.load_metadata()
-    if not metadata:
-        return "ERROR: Metadata store is empty. Run summarise_documents first."
-
-    questions = _download_questions()
-    prompt = _build_plan_prompt(questions, metadata)
-
-    gemini = _get_gemini()
-    response = gemini.models.generate_content(model=MODEL_NAME, contents=prompt)
-    raw = response.text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[1]
-        raw = raw.rsplit("```", 1)[0].strip()
-
-    plans = json.loads(raw)
-    st.save_plans(plans)
-
-    answered = sum(1 for p in plans if p.get("answer_found"))
-    planned = len(plans) - answered
-    return (
-        f"Question planning complete. {len(plans)} question(s) total — "
-        f"{answered} answered from summaries, {planned} need deep research."
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TOOL 3: DEEP RESEARCH (single question)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def _query_document(doc_name: str, blob_bytes: bytes,
                     question: str, what_to_find: str) -> str:
     ext = Path(doc_name).suffix.lower()
@@ -359,7 +252,7 @@ def _query_document(doc_name: str, blob_bytes: bytes,
     )
     gemini = _get_gemini()
     if mime:
-        part = types.Part.from_bytes(data=blob_bytes, mime_type=mime)
+        part = genai_types.Part.from_bytes(data=blob_bytes, mime_type=mime)
         contents = [part, prompt]
     else:
         if ext == ".docx":
@@ -458,7 +351,7 @@ def _answer_directly_from_doc(doc_name: str, blob_bytes: bytes, question: str) -
     )
     gemini = _get_gemini()
     if mime:
-        part = types.Part.from_bytes(data=blob_bytes, mime_type=mime)
+        part = genai_types.Part.from_bytes(data=blob_bytes, mime_type=mime)
         contents = [part, prompt]
     else:
         if ext == ".docx":
@@ -472,12 +365,118 @@ def _answer_directly_from_doc(doc_name: str, blob_bytes: bytes, question: str) -
     return response.text.strip()
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# LANGCHAIN TOOLS (decorated with @tool)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@tool
+def summarise_documents() -> str:
+    """Ingest every supported document (PDF, DOCX, XLSX) from the GCS bucket,
+    extract text, and build the metadata store with Gemini-generated summaries.
+    Idempotent — skips documents already processed. Must run before plan_questions."""
+    st.ensure_dirs()
+    conn = _init_db()
+    gcs = _get_gcs()
+    gemini = _get_gemini()
+
+    bucket = gcs.bucket(BUCKET_NAME)
+    blobs = list(bucket.list_blobs(prefix=PREFIX))
+
+    existing = {
+        r[0] for r in conn.execute("SELECT document_name FROM metadata_store").fetchall()
+    }
+
+    processed = 0
+    skipped = 0
+    errors = 0
+
+    for blob in blobs:
+        name = blob.name
+        if name.endswith("/"):
+            continue
+        ext = Path(name).suffix.lower()
+        doc_name = Path(name).name
+        if ext not in SUPPORTED_EXTENSIONS:
+            continue
+        if doc_name in existing:
+            skipped += 1
+            continue
+
+        try:
+            blob_bytes = blob.download_as_bytes()
+            if ext == ".pdf":
+                chunk, method = extract_pdf_text(blob_bytes)
+            elif ext == ".docx":
+                chunk, method = extract_docx_text(blob_bytes)
+            elif ext in (".xlsx", ".xls"):
+                chunk, method = extract_excel_text(blob_bytes, ext)
+            else:
+                continue
+
+            if not chunk:
+                _upsert_row(conn, doc_name, "[no content extracted]", method, "")
+                continue
+
+            summary = _summarize_with_gemini(gemini, doc_name, chunk)
+            _upsert_row(conn, doc_name, summary, method, chunk)
+            processed += 1
+        except Exception as e:
+            _upsert_row(conn, doc_name, f"[error: {e}]", "error", "")
+            errors += 1
+
+    # Export CSV
+    df = pd.read_sql_query(
+        "SELECT document_name, brief_summary, extraction_method FROM metadata_store", conn
+    )
+    conn.close()
+    CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(CSV_PATH, index=False)
+
+    total = len(df)
+    return (
+        f"Metadata store ready. {total} document(s) total — "
+        f"{processed} newly processed, {skipped} cached, {errors} error(s)."
+    )
+
+
+@tool
+def plan_questions() -> str:
+    """Download the questions spreadsheet from GCS, load the metadata store,
+    and call Gemini to produce a structured JSON research plan for every question.
+    Some questions may be answered directly from summaries.
+    Requires metadata store to be ready first."""
+    st.ensure_dirs()
+    metadata = st.load_metadata()
+    if not metadata:
+        return "ERROR: Metadata store is empty. Run summarise_documents first."
+
+    questions = _download_questions()
+    prompt = _build_plan_prompt(questions, metadata)
+
+    gemini = _get_gemini()
+    response = gemini.models.generate_content(model=MODEL_NAME, contents=prompt)
+    raw = response.text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1]
+        raw = raw.rsplit("```", 1)[0].strip()
+
+    plans = json.loads(raw)
+    st.save_plans(plans)
+
+    answered = sum(1 for p in plans if p.get("answer_found"))
+    planned = len(plans) - answered
+    return (
+        f"Question planning complete. {len(plans)} question(s) total — "
+        f"{answered} answered from summaries, {planned} need deep research."
+    )
+
+
+@tool
 def deep_research(question_number: int) -> str:
-    """
-    Perform one round of deep research for a single question (1-indexed).
-    Downloads plan documents, queries them via Gemini, evaluates sufficiency,
-    and refines the plan if needed. Returns a status string.
-    """
+    """Perform one round of deep research for a single question (1-indexed).
+    Downloads the plan's referenced documents from GCS, queries each via Gemini,
+    evaluates answer sufficiency, and refines the plan if needed.
+    Call this for specific questions that need attention."""
     plans = st.load_plans()
     idx = question_number - 1
     if idx < 0 or idx >= len(plans):
@@ -491,7 +490,7 @@ def deep_research(question_number: int) -> str:
     blob_map = _get_blob_map()
     metadata = st.load_metadata()
 
-    # ── Already answered — verify ────────────────────────────────────────────
+    # Already answered — verify
     if answer_found:
         verdict = _evaluate_answer(question, answer_found, data_found)
         if verdict["sufficient"]:
@@ -499,7 +498,7 @@ def deep_research(question_number: int) -> str:
         answer_found = None
         entry["answer_found"] = None
 
-    # ── Check existing data_found ────────────────────────────────────────────
+    # Check existing data_found
     if data_found:
         verdict = _evaluate_answer(question, None, data_found)
         if verdict["sufficient"]:
@@ -507,13 +506,12 @@ def deep_research(question_number: int) -> str:
             st.save_single_plan(idx, entry)
             return f"Q{question_number} answered via synthesis from existing data."
 
-        # Refine plan
         refined = _refine_plan(question, plan, data_found, metadata)
         if refined:
             plan = plan + refined
             entry["plan"] = plan
 
-    # ── Generate plan if missing ─────────────────────────────────────────────
+    # Generate plan if missing
     if not plan:
         prompt = _build_plan_prompt([question], metadata)
         gemini = _get_gemini()
@@ -526,7 +524,7 @@ def deep_research(question_number: int) -> str:
         entry.update(new_plans[0])
         plan = entry.get("plan", [])
 
-    # ── Execute plan — parallel doc queries ──────────────────────────────────
+    # Execute plan — parallel doc queries
     start = len(data_found)
     remaining = list(enumerate(plan))[start:]
 
@@ -555,14 +553,14 @@ def deep_research(question_number: int) -> str:
             data_found.append(results[i])
         entry["data_found"] = data_found
 
-    # ── Post-execution synthesis ─────────────────────────────────────────────
+    # Post-execution synthesis
     verdict = _evaluate_answer(question, None, data_found)
     if verdict["sufficient"]:
         entry["answer_found"] = verdict["synthesised_answer"]
         st.save_single_plan(idx, entry)
         return f"Q{question_number} answered after executing plan ({len(plan)} doc(s) queried)."
 
-    # ── Direct fallback ──────────────────────────────────────────────────────
+    # Direct fallback
     refined = _refine_plan(question, plan, data_found, metadata)
     if refined:
         entry["plan"] = plan + refined
@@ -572,7 +570,6 @@ def deep_research(question_number: int) -> str:
             f"{len(refined)} new item(s) for next round."
         )
 
-    # No more refinement possible — direct query fallback
     direct_answers = []
     for plan_item in plan:
         doc_name = next(iter(plan_item))
@@ -601,16 +598,46 @@ def deep_research(question_number: int) -> str:
     return f"Q{question_number} answered via direct document fallback."
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TOOL 4: GET CURRENT STATE
-# ═══════════════════════════════════════════════════════════════════════════════
+@tool
+def deep_research_all_unanswered() -> str:
+    """Run deep_research for every unanswered question in parallel.
+    Use this to process an entire batch of unanswered questions at once."""
+    plans = st.load_plans()
+    unanswered = [i for i, p in enumerate(plans) if not p.get("answer_found")]
+    if not unanswered:
+        return "All questions are already answered."
 
+    results = []
+
+    def _run(idx):
+        try:
+            return (idx, deep_research.invoke({"question_number": idx + 1}))
+        except Exception as e:
+            return (idx, f"Q{idx+1} ERROR: {e}")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futs = {pool.submit(_run, i): i for i in unanswered}
+        for fut in as_completed(futs):
+            idx, msg = fut.result()
+            results.append(msg)
+
+    plans = st.load_plans()
+    st.save_plans(plans)
+    still_unanswered = sum(1 for p in plans if not p.get("answer_found"))
+
+    header = (
+        f"Deep research batch complete. "
+        f"{len(plans) - still_unanswered}/{len(plans)} answered, "
+        f"{still_unanswered} remaining."
+    )
+    return header + "\n" + "\n".join(results)
+
+
+@tool
 def check_pipeline_state() -> str:
-    """
-    Return a human-readable summary of the current pipeline state:
-    whether the metadata store exists, how many questions are planned,
-    how many are answered vs. unanswered.
-    """
+    """Return a summary of the current pipeline state: whether the metadata store
+    and question plans exist, how many questions are answered vs. unanswered,
+    and which question numbers still need work. Use this to decide what to do next."""
     s = st.get_pipeline_state()
     lines = []
     lines.append(f"Metadata store ready: {s['metadata_ready']} ({s['metadata_count']} documents)")
@@ -620,21 +647,15 @@ def check_pipeline_state() -> str:
         lines.append(f"Answered: {s['answered']}")
         lines.append(f"Unanswered: {s['unanswered']}")
         if s["unanswered_indices"]:
-            # Show 1-indexed
             nums = [str(i + 1) for i in s["unanswered_indices"]]
             lines.append(f"Unanswered question numbers: {', '.join(nums)}")
     return "\n".join(lines)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TOOL 5: GET QUESTION DETAILS
-# ═══════════════════════════════════════════════════════════════════════════════
-
+@tool
 def get_question_detail(question_number: int) -> str:
-    """
-    Return the full current state for a single question: its text,
-    answer_found (if any), plan items, and count of data_found entries.
-    """
+    """Return the full current state for a single question: its text,
+    answer_found (if any), plan items, and count of data_found entries."""
     plans = st.load_plans()
     idx = question_number - 1
     if idx < 0 or idx >= len(plans):
@@ -654,55 +675,10 @@ def get_question_detail(question_number: int) -> str:
     return "\n".join(lines)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TOOL 6: DEEP RESEARCH BATCH (all unanswered)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def deep_research_all_unanswered() -> str:
-    """
-    Run deep_research for every unanswered question in parallel
-    (up to MAX_WORKERS concurrently). Returns a summary of results.
-    """
-    plans = st.load_plans()
-    unanswered = [i for i, p in enumerate(plans) if not p.get("answer_found")]
-    if not unanswered:
-        return "All questions are already answered."
-
-    results = []
-
-    def _run(idx):
-        try:
-            return (idx, deep_research(idx + 1))
-        except Exception as e:
-            return (idx, f"Q{idx+1} ERROR: {e}")
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futs = {pool.submit(_run, i): i for i in unanswered}
-        for fut in as_completed(futs):
-            idx, msg = fut.result()
-            results.append(msg)
-
-    # Reload plans to get final state
-    plans = st.load_plans()
-    st.save_plans(plans)
-    still_unanswered = sum(1 for p in plans if not p.get("answer_found"))
-
-    header = (
-        f"Deep research batch complete. "
-        f"{len(plans) - still_unanswered}/{len(plans)} answered, "
-        f"{still_unanswered} remaining."
-    )
-    return header + "\n" + "\n".join(results)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TOOL 7: FINAL REPORT
-# ═══════════════════════════════════════════════════════════════════════════════
-
+@tool
 def get_final_report() -> str:
-    """
-    Return a formatted report of every question and its current answer.
-    """
+    """Return a formatted report of every question and its current answer.
+    Use at the end to present results."""
     plans = st.load_plans()
     if not plans:
         return "No question plans found."
@@ -717,71 +693,15 @@ def get_final_report() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TOOL REGISTRY  (for the agent to discover)
+# TOOL REGISTRY — all LangChain tools
 # ═══════════════════════════════════════════════════════════════════════════════
 
-TOOL_FUNCTIONS = {
-    "summarise_documents": summarise_documents,
-    "plan_questions": plan_questions,
-    "deep_research": deep_research,
-    "deep_research_all_unanswered": deep_research_all_unanswered,
-    "check_pipeline_state": check_pipeline_state,
-    "get_question_detail": get_question_detail,
-    "get_final_report": get_final_report,
-}
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# META-TOOLS: Dynamic tool creation
-# ═══════════════════════════════════════════════════════════════════════════════
-
-from tool_forge import (
-    create_tool as _forge_create_tool,
-    list_custom_tools as _forge_list_custom_tools,
-    delete_tool as _forge_delete_tool,
-    get_tool_audit_log as _forge_get_audit_log,
-)
-
-
-def create_tool(name: str, description: str, code: str,
-                parameters: str = "{}") -> str:
-    """
-    Dynamically create a new tool. The agent writes Python code that defines
-    a function with the given name. The tool becomes callable on the next turn.
-
-    Args:
-        name: Tool name (valid Python identifier).
-        description: What the tool does.
-        code: Python source defining `def <name>(...): ...`
-        parameters: JSON string of a JSON-Schema-like parameter description.
-    """
-    import json as _json
-    try:
-        params = _json.loads(parameters) if parameters else {}
-    except _json.JSONDecodeError as e:
-        return f"ERROR: Could not parse parameters JSON: {e}"
-    return _forge_create_tool(
-        name=name, description=description, code=code, parameters=params,
-    )
-
-
-def list_custom_tools() -> str:
-    """List all dynamically created tools with their descriptions and code previews."""
-    return _forge_list_custom_tools()
-
-
-def delete_tool(name: str) -> str:
-    """Delete a dynamically created tool by name."""
-    return _forge_delete_tool(name=name)
-
-
-def get_tool_audit_log(last_n: int = 50) -> str:
-    """Return the last N entries from the tool creation audit log."""
-    return _forge_get_audit_log(last_n=last_n)
-
-
-# Add meta-tools to the registry
-TOOL_FUNCTIONS["create_tool"] = create_tool
-TOOL_FUNCTIONS["list_custom_tools"] = list_custom_tools
-TOOL_FUNCTIONS["delete_tool"] = delete_tool
-TOOL_FUNCTIONS["get_tool_audit_log"] = get_tool_audit_log
+PIPELINE_TOOLS = [
+    summarise_documents,
+    plan_questions,
+    deep_research,
+    deep_research_all_unanswered,
+    check_pipeline_state,
+    get_question_detail,
+    get_final_report,
+]
