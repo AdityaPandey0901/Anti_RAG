@@ -1,17 +1,35 @@
 # Credentials & secrets
 .env
-cciscrape-d55fa0df8a7a.json
-cciscrape-1d50a9ea47ef.json
+.env.*
+*.json.key
+cciscrape-*.json
+*service-account*.json
+*credentials*.json
 
 # Virtual environment
 venv/
+.venv/
 
 # Python cache
 __pycache__/
 *.pyc
 *.pyo
 
-# Agent outputs
+# OS clutter
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Agent / pipeline outputs (generated, may contain scraped document content)
 pi-agent/output/
 lang-chain-agent/output/
+parallelized/Plan_Docs/
+Plan_Docs/
+*.db
+*metadata_store.csv
 
+# CTF_Stuff contains live auth tokens tied to a personal account — see README.
+# Keep it out of a public repo entirely unless scrubbed.
+CTF_Stuff/

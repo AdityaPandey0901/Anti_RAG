@@ -24,6 +24,11 @@ from langchain.agents import create_agent
 from config import MODEL_NAME, GEMINI_API_KEY, MAX_ROUNDS
 from tools import PIPELINE_TOOLS
 from tool_forge import META_TOOLS, get_dynamic_lc_tools
+from cache import init_langchain_cache, print_cache_stats
+from path_cache import path_cache, extract_tool_calls
+
+# Activate the LangChain LLM cache before any LLM is instantiated.
+init_langchain_cache()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -162,6 +167,25 @@ def run_agent(
     """
     start = time.time()
 
+    # ── Execution path cache check ──────────────────────────────────────────
+    cached_answer = path_cache.get_answer(user_message)
+    if cached_answer is not None:
+        if verbose:
+            record = path_cache.get_path(user_message)
+            n_calls = len(record["tool_calls"]) if record else "?"
+            print(f"\n{'═'*60}")
+            print(f"  Path cache HIT  ({n_calls} tool calls replayed, 0 LLM calls)")
+            print(f"  Original run: {record['created_at'] if record else '?':.0f} epoch  "
+                  f"| Replay count: {record['hit_count'] if record else '?'}")
+            if record and record["tool_calls"]:
+                print("  Stored execution path:")
+                for step in record["tool_calls"]:
+                    args_preview = str(step.get("args", {}))[:80]
+                    print(f"    [{step['turn_index']}] {step['name']}({args_preview})")
+            print(f"{'═'*60}")
+        return cached_answer
+    # ───────────────────────────────────────────────────────────────────────
+
     llm = _build_llm()
 
     if verbose:
@@ -177,6 +201,7 @@ def run_agent(
     messages = [HumanMessage(content=user_message)]
     final_text = ""
     turns_used = 0
+    final_messages: list = []   # accumulates across all epochs for path recording
 
     # Run in epochs. Each epoch creates a fresh agent (picking up new tools)
     # and streams through until the agent stops calling tools or hits the cap.
@@ -209,6 +234,7 @@ def run_agent(
 
         # Extract messages from the result
         output_messages = result.get("messages", [])
+        final_messages = output_messages   # keep the latest complete history
 
         if verbose:
             for msg in output_messages:
@@ -255,11 +281,19 @@ def run_agent(
         # Agent finished naturally
         break
 
+    # ── Record execution path for future identical queries ──────────────────
+    if final_text and final_messages:
+        tool_calls = extract_tool_calls(final_messages)
+        path_cache.record(user_message, tool_calls, final_text)
+    # ────────────────────────────────────────────────────────────────────────
+
     elapsed = time.time() - start
     if verbose:
         print(f"\n{'═'*60}")
         print(f"  Agent finished in {elapsed:.1f}s ({turns_used} turn(s), {epoch} epoch(s))")
         print(f"  View traces at: https://smith.langchain.com")
+        print_cache_stats()
+        print(f"  {path_cache.stats()}")
         print(f"{'═'*60}")
 
     return final_text if isinstance(final_text, str) else str(final_text)

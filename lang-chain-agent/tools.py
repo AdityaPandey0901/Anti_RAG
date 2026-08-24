@@ -35,6 +35,7 @@ from config import (
     OUTPUT_DIR, CSV_PATH, DB_PATH,
 )
 import state as st
+from cache import gemini_cache, blob_cache
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -75,6 +76,18 @@ def _get_blob_map() -> dict[str, object]:
             if not b.name.endswith("/"):
                 _blob_map[Path(b.name).name] = b
     return _blob_map
+
+
+def _cached_download(blob) -> bytes:
+    """Download a GCS blob, serving from local disk cache when possible."""
+    bucket_name = blob.bucket.name
+    generation  = getattr(blob, "generation", None)
+    cached = blob_cache.get(bucket_name, blob.name, generation)
+    if cached is not None:
+        return cached
+    data = blob.download_as_bytes()
+    blob_cache.set(bucket_name, blob.name, generation, data)
+    return data
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -158,6 +171,10 @@ def _upsert_row(conn, doc_name, summary, method, chunk):
 
 
 def _summarize_with_gemini(client, doc_name: str, chunk: str) -> str:
+    key = gemini_cache.make_key("summarize", doc_name, chunk)
+    cached = gemini_cache.get(key)
+    if cached is not None:
+        return cached
     prompt = (
         f'You are looking at the first few pages (or full contents for spreadsheets) '
         f'of a larger document named "{doc_name}".\n\n'
@@ -166,14 +183,16 @@ def _summarize_with_gemini(client, doc_name: str, chunk: str) -> str:
         f"provide a brief summary (2-4 sentences)."
     )
     response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
-    return response.text.strip()
+    text = response.text.strip()
+    gemini_cache.set(key, text)
+    return text
 
 
 def _download_questions() -> list[str]:
     client = _get_gcs()
     bucket = client.bucket(Q_BUCKET)
     blob = bucket.blob(Q_BLOB)
-    data = blob.download_as_bytes()
+    data = _cached_download(blob)
     xls = pd.ExcelFile(io.BytesIO(data), engine="openpyxl")
     df = xls.parse(xls.sheet_names[0])
     col = next(
@@ -250,6 +269,10 @@ def _query_document(doc_name: str, blob_bytes: bytes,
         f"<your answer to the research question based solely on the above passages, "
         f"or a statement that this document is insufficient to answer it>"
     )
+    key = gemini_cache.make_key("query_doc", doc_name, blob_bytes, question, what_to_find)
+    cached = gemini_cache.get(key)
+    if cached is not None:
+        return cached
     gemini = _get_gemini()
     if mime:
         part = genai_types.Part.from_bytes(data=blob_bytes, mime_type=mime)
@@ -263,11 +286,18 @@ def _query_document(doc_name: str, blob_bytes: bytes,
             return f"NOT FOUND: unsupported file type {ext}"
         contents = [f"DOCUMENT CONTENTS ({doc_name}):\n{text}\n\nQUESTION:\n{prompt}"]
     response = gemini.models.generate_content(model=MODEL_NAME, contents=contents)
-    return response.text.strip()
+    result = response.text.strip()
+    gemini_cache.set(key, result)
+    return result
 
 
 def _evaluate_answer(question: str, answer_found: str | None,
                      data_found: list[str]) -> dict:
+    key = gemini_cache.make_key("evaluate", question, answer_found or "", data_found)
+    cached = gemini_cache.get(key)
+    if cached is not None:
+        return json.loads(cached)
+
     sections = []
     if answer_found:
         sections.append(f"=== CURRENT ANSWER ===\n{answer_found}\n=== END CURRENT ANSWER ===")
@@ -301,11 +331,18 @@ def _evaluate_answer(question: str, answer_found: str | None,
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[1]
         raw = raw.rsplit("```", 1)[0].strip()
-    return json.loads(raw)
+    result = json.loads(raw)
+    gemini_cache.set(key, json.dumps(result))
+    return result
 
 
 def _refine_plan(question: str, existing_plan: list[dict],
                  data_found: list[str], metadata: list[dict]) -> list[dict]:
+    key = gemini_cache.make_key("refine", question, existing_plan, data_found, metadata)
+    cached = gemini_cache.get(key)
+    if cached is not None:
+        return json.loads(cached)
+
     metadata_text = json.dumps(metadata, indent=2)
     plan_text = json.dumps(existing_plan, indent=2)
     data_text = "\n\n---\n\n".join(data_found) if data_found else "(none yet)"
@@ -330,7 +367,9 @@ def _refine_plan(question: str, existing_plan: list[dict],
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[1]
         raw = raw.rsplit("```", 1)[0].strip()
-    return json.loads(raw)
+    result = json.loads(raw)
+    gemini_cache.set(key, json.dumps(result))
+    return result
 
 
 def _answer_directly_from_doc(doc_name: str, blob_bytes: bytes, question: str) -> str:
@@ -349,6 +388,10 @@ def _answer_directly_from_doc(doc_name: str, blob_bytes: bytes, question: str) -
         f"4. If the document does not contain the answer, state clearly: "
         f"NOT FOUND IN THIS DOCUMENT: <reason>."
     )
+    key = gemini_cache.make_key("answer_direct", doc_name, blob_bytes, question)
+    cached = gemini_cache.get(key)
+    if cached is not None:
+        return cached
     gemini = _get_gemini()
     if mime:
         part = genai_types.Part.from_bytes(data=blob_bytes, mime_type=mime)
@@ -362,7 +405,9 @@ def _answer_directly_from_doc(doc_name: str, blob_bytes: bytes, question: str) -
             return f"NOT FOUND: unsupported file type {ext}"
         contents = [f"DOCUMENT CONTENTS ({doc_name}):\n{text}\n\nQUESTION:\n{prompt}"]
     response = gemini.models.generate_content(model=MODEL_NAME, contents=contents)
-    return response.text.strip()
+    result = response.text.strip()
+    gemini_cache.set(key, result)
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -403,7 +448,7 @@ def summarise_documents() -> str:
             continue
 
         try:
-            blob_bytes = blob.download_as_bytes()
+            blob_bytes = _cached_download(blob)
             if ext == ".pdf":
                 chunk, method = extract_pdf_text(blob_bytes)
             elif ext == ".docx":
@@ -453,12 +498,18 @@ def plan_questions() -> str:
     questions = _download_questions()
     prompt = _build_plan_prompt(questions, metadata)
 
-    gemini = _get_gemini()
-    response = gemini.models.generate_content(model=MODEL_NAME, contents=prompt)
-    raw = response.text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[1]
-        raw = raw.rsplit("```", 1)[0].strip()
+    plan_key = gemini_cache.make_key("plan_questions", prompt)
+    plan_cached = gemini_cache.get(plan_key)
+    if plan_cached is not None:
+        raw = plan_cached
+    else:
+        gemini = _get_gemini()
+        response = gemini.models.generate_content(model=MODEL_NAME, contents=prompt)
+        raw = response.text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1]
+            raw = raw.rsplit("```", 1)[0].strip()
+        gemini_cache.set(plan_key, raw)
 
     plans = json.loads(raw)
     st.save_plans(plans)
@@ -514,12 +565,18 @@ def deep_research(question_number: int) -> str:
     # Generate plan if missing
     if not plan:
         prompt = _build_plan_prompt([question], metadata)
-        gemini = _get_gemini()
-        response = gemini.models.generate_content(model=MODEL_NAME, contents=prompt)
-        raw = response.text.strip()
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1]
-            raw = raw.rsplit("```", 1)[0].strip()
+        _single_plan_key = gemini_cache.make_key("plan_questions", prompt)
+        _cached_raw = gemini_cache.get(_single_plan_key)
+        if _cached_raw is not None:
+            raw = _cached_raw
+        else:
+            gemini = _get_gemini()
+            response = gemini.models.generate_content(model=MODEL_NAME, contents=prompt)
+            raw = response.text.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1]
+                raw = raw.rsplit("```", 1)[0].strip()
+            gemini_cache.set(_single_plan_key, raw)
         new_plans = json.loads(raw)
         entry.update(new_plans[0])
         plan = entry.get("plan", [])
@@ -537,7 +594,7 @@ def deep_research(question_number: int) -> str:
             if blob is None:
                 return (i, f"NOT FOUND IN GCS: {doc_name}")
             try:
-                bb = blob.download_as_bytes()
+                bb = _cached_download(blob)
                 return (i, _query_document(doc_name, bb, question, what))
             except Exception as e:
                 return (i, f"ERROR: {e}")
@@ -578,7 +635,7 @@ def deep_research(question_number: int) -> str:
             direct_answers.append(f"NOT IN BUCKET: {doc_name}")
             continue
         try:
-            bb = blob.download_as_bytes()
+            bb = _cached_download(blob)
             ans = _answer_directly_from_doc(doc_name, bb, question)
             direct_answers.append(f"[Direct — {doc_name}]\n{ans}")
         except Exception as e:
