@@ -12,12 +12,12 @@ from __future__ import annotations
 import io
 import json
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
-from google.cloud import storage
 from google import genai
 from google.genai import types
 
@@ -28,7 +28,7 @@ from PIL import Image
 from docx import Document as DocxDocument
 
 from config import (
-    BUCKET_NAME, PREFIX, Q_BUCKET, Q_BLOB,
+    DATA_PATH, QUESTIONS_PATH,
     VERTEX_PROJECT, VERTEX_LOCATION,
     MODEL_NAME, MAX_WORKERS,
     SUPPORTED_EXTENSIONS, NATIVE_MIME,
@@ -36,9 +36,11 @@ from config import (
 )
 import state as st
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for `core`
+from core.sources import get_document_source, load_questions
+
 # ── Shared clients (lazy-initialised) ────────────────────────────────────────
 _gemini: genai.Client | None = None
-_gcs: storage.Client | None = None
 _blob_map: dict[str, object] | None = None
 
 
@@ -53,23 +55,10 @@ def _get_gemini() -> genai.Client:
     return _gemini
 
 
-def _get_gcs() -> storage.Client:
-    global _gcs
-    if _gcs is None:
-        _gcs = storage.Client()
-    return _gcs
-
-
 def _get_blob_map() -> dict[str, object]:
     global _blob_map
     if _blob_map is None:
-        client = _get_gcs()
-        bucket = client.bucket(BUCKET_NAME)
-        blobs = bucket.list_blobs(prefix=PREFIX)
-        _blob_map = {}
-        for b in blobs:
-            if not b.name.endswith("/"):
-                _blob_map[Path(b.name).name] = b
+        _blob_map = get_document_source(DATA_PATH).list_documents()
     return _blob_map
 
 
@@ -173,11 +162,9 @@ def summarise_documents() -> str:
     """
     st.ensure_dirs()
     conn = _init_db()
-    gcs = _get_gcs()
     gemini = _get_gemini()
 
-    bucket = gcs.bucket(BUCKET_NAME)
-    blobs = list(bucket.list_blobs(prefix=PREFIX))
+    docs = _get_blob_map()
 
     existing = {
         r[0] for r in conn.execute("SELECT document_name FROM metadata_store").fetchall()
@@ -187,12 +174,8 @@ def summarise_documents() -> str:
     skipped = 0
     errors = 0
 
-    for blob in blobs:
-        name = blob.name
-        if name.endswith("/"):
-            continue
-        ext = Path(name).suffix.lower()
-        doc_name = Path(name).name
+    for doc_name, blob in docs.items():
+        ext = Path(doc_name).suffix.lower()
         if ext not in SUPPORTED_EXTENSIONS:
             continue
         if doc_name in existing:
@@ -241,17 +224,7 @@ def summarise_documents() -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _download_questions() -> list[str]:
-    client = _get_gcs()
-    bucket = client.bucket(Q_BUCKET)
-    blob = bucket.blob(Q_BLOB)
-    data = blob.download_as_bytes()
-    xls = pd.ExcelFile(io.BytesIO(data), engine="openpyxl")
-    df = xls.parse(xls.sheet_names[0])
-    col = next(
-        (c for c in df.columns if str(c).strip().lower() in ("question", "questions")),
-        df.columns[0],
-    )
-    return df[col].dropna().astype(str).str.strip().tolist()
+    return load_questions(QUESTIONS_PATH)
 
 
 def _build_plan_prompt(questions: list[str], metadata: list[dict]) -> str:
