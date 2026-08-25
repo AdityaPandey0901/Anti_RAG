@@ -249,8 +249,8 @@ VERTEX_CREDENTIALS_PATH=path/to/vertex-service-account.json
 VERTEX_PROJECT=your-gcp-project
 VERTEX_LOCATION=us-central1
 
-# Only needed for lang-chain-agent (tracing)
-LANGCHAIN_API_KEY=your-langsmith-api-key
+# Only needed for lang-chain-agent (tracing, optional)
+LANGSMITH_API_KEY=your-langsmith-api-key
 ```
 
 Every implementation reads its own copy of these values from `.env` at the repo root — none of it is checked into git (see [Making This Public](#making-this-public)).

@@ -18,9 +18,12 @@ ENV_PATH     = PROJECT_ROOT / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
 # ── LangSmith Observability ──────────────────────────────────────────────────
-os.environ["LANGSMITH_API_KEY"]  = "REDACTED_LANGSMITH_KEY"
-os.environ["LANGSMITH_TRACING"]  = "true"
-os.environ["LANGSMITH_PROJECT"]  = "pi-agent-langchain"
+# Tracing is opt-in: only enabled when LANGSMITH_API_KEY is set in .env.
+LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY", "")
+if LANGSMITH_API_KEY:
+    os.environ["LANGSMITH_API_KEY"] = LANGSMITH_API_KEY
+    os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGSMITH_PROJECT"] = "pi-agent-langchain"
 os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
 
 # ── GCP credentials ──────────────────────────────────────────────────────────
