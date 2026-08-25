@@ -54,11 +54,7 @@ Each one is runnable on its own. See its section below for setup and usage.
 │   ├── cache.py, path_cache.py    # LLM response caching / call-path memoisation
 │   ├── state.py, config.py, run.py
 │   └── output/                    # Generated
-│
-└── CTF_Stuff/                     # NOT part of the document-intelligence system — see note below
-```
 
-> **`CTF_Stuff/`** holds scripts and captured responses from an unrelated side-challenge (a timed trivia/prompt-injection puzzle against a third-party site). It currently contains a live bearer token tied to a personal account and should not be published as-is — see the [Making This Public](#making-this-public) section.
 
 ---
 
