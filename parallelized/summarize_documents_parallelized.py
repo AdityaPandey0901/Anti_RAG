@@ -18,6 +18,7 @@ Parallelized version of summarize_documents.py.
 import os
 import io
 import re
+import sys
 import json
 import sqlite3
 import tempfile
@@ -31,8 +32,10 @@ import pytesseract
 from PIL import Image
 from docx import Document as DocxDocument
 from dotenv import load_dotenv
-from google.cloud import storage
 from google import genai
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for `core`
+from core.sources import get_document_source
 
 # ── Configuration ────────────────────────────────────────────────────────────
 load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
@@ -239,11 +242,9 @@ def _summarize_one(gemini_client, doc_name: str, chunk: str, method: str) -> dic
 # ── Main pipeline (fully parallelized) ──────────────────────────────────────
 
 def main():
-    # ── 1. List blobs ────────────────────────────────────────────────────────
-    gcs_client = storage.Client()
-    bucket = gcs_client.bucket(BUCKET_NAME)
-    blobs = list(bucket.list_blobs(prefix=PREFIX))
-    print(f"Found {len(blobs)} objects under gs://{BUCKET_NAME}/{PREFIX}")
+    # ── 1. List documents ────────────────────────────────────────────────────
+    blobs = list(get_document_source(DATA_PATH).list_documents().values())
+    print(f"Found {len(blobs)} objects under {DATA_PATH}")
 
     # Check which documents are already in the DB so we can skip them
     conn = init_db()

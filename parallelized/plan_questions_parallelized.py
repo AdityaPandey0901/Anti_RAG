@@ -28,7 +28,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 from dotenv import load_dotenv
-from google.cloud import storage
 from google import genai
 from google.genai import types
 
@@ -41,8 +40,7 @@ try:
         extract_pdf_text,
         extract_docx_text,
         extract_excel_text,
-        BUCKET_NAME,
-        PREFIX,
+        DATA_PATH,
     )
 except ModuleNotFoundError:
     from parallelized.summarize_documents_parallelized import (
@@ -50,9 +48,11 @@ except ModuleNotFoundError:
         extract_pdf_text,
         extract_docx_text,
         extract_excel_text,
-        BUCKET_NAME,
-        PREFIX,
+        DATA_PATH,
     )
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for `core`
+from core.sources import get_document_source, load_questions
 
 # ── Config ───────────────────────────────────────────────────────────────────
 load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
@@ -131,31 +131,13 @@ def _write_coalesced(plans: list[dict]):
 # ── GCS / Question download ─────────────────────────────────────────────────
 
 def download_questions() -> list[str]:
-    client = storage.Client()
-    bucket = client.bucket(Q_BUCKET)
-    blob   = bucket.blob(Q_BLOB)
-    data   = blob.download_as_bytes()
-
-    xls = pd.ExcelFile(io.BytesIO(data), engine="openpyxl")
-    df  = xls.parse(xls.sheet_names[0])
-
-    col = next(
-        (c for c in df.columns if str(c).strip().lower() in ("question", "questions")),
-        df.columns[0],
-    )
-    questions = df[col].dropna().astype(str).str.strip().tolist()
-    print(f"  Loaded {len(questions)} questions from column '{col}'.")
+    questions = load_questions(QUESTIONS_PATH)
+    print(f"  Loaded {len(questions)} questions.")
     return questions
 
 
-def _build_gcs_blob_map(gcs_client) -> dict[str, object]:
-    bucket = gcs_client.bucket(BUCKET_NAME)
-    blobs  = bucket.list_blobs(prefix=PREFIX)
-    result = {}
-    for b in blobs:
-        if not b.name.endswith("/"):
-            result[Path(b.name).name] = b
-    return result
+def _build_document_map() -> dict[str, object]:
+    return get_document_source(DATA_PATH).list_documents()
 
 
 # ── Gemini planning call (batch-friendly) ────────────────────────────────────
@@ -401,7 +383,7 @@ def _refine_plan(gemini_client, question: str, existing_plan: list[dict],
 
 # ── Parallel deep-pull for a single question ─────────────────────────────────
 
-def _deep_pull_one(idx: int, entry: dict, gcs_blob_map: dict,
+def _deep_pull_one(idx: int, entry: dict, document_map: dict,
                    gemini_client, metadata: list[dict]) -> dict:
     """
     Execute one full deep-pull iteration for a single question (by index).
@@ -471,7 +453,7 @@ def _deep_pull_one(idx: int, entry: dict, gcs_blob_map: dict,
             i, plan_item = item_idx_and_plan
             doc_name     = next(iter(plan_item))
             what_to_find = plan_item[doc_name]
-            blob = gcs_blob_map.get(doc_name)
+            blob = document_map.get(doc_name)
             if blob is None:
                 return (i, f"NOT FOUND IN GCS: {doc_name}")
             try:
@@ -524,7 +506,7 @@ def _deep_pull_one(idx: int, entry: dict, gcs_blob_map: dict,
 
         def _direct_one(plan_item):
             doc_name = next(iter(plan_item))
-            blob     = gcs_blob_map.get(doc_name)
+            blob     = document_map.get(doc_name)
             if blob is None:
                 return f"NOT IN BUCKET: {doc_name}"
             try:
@@ -618,10 +600,9 @@ def run_deep_dive():
     print(f"Starting parallel deep dive on {total} question(s)...\n")
 
     gemini_client = genai.Client(vertexai=True, project=VERTEX_PROJECT, location=VERTEX_LOCATION)
-    gcs_client    = storage.Client()
-    print("Building GCS blob index...")
-    gcs_blob_map  = _build_gcs_blob_map(gcs_client)
-    print(f"  {len(gcs_blob_map)} documents indexed.\n")
+    print("Building document index...")
+    document_map  = _build_document_map()
+    print(f"  {len(document_map)} documents indexed.\n")
 
     metadata = get_metadata_store()
 
@@ -643,7 +624,7 @@ def run_deep_dive():
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             futures = {
                 pool.submit(
-                    _deep_pull_one, i, plans[i], gcs_blob_map, gemini_client, metadata
+                    _deep_pull_one, i, plans[i], document_map, gemini_client, metadata
                 ): i
                 for i in unanswered
             }
@@ -756,10 +737,9 @@ def run_all(max_rounds: int = 5):
 
     # ── Step 3: Parallel deep-dive loop ──────────────────────────────────────
     gemini_client = genai.Client(vertexai=True, project=VERTEX_PROJECT, location=VERTEX_LOCATION)
-    gcs_client    = storage.Client()
-    print("Building GCS blob index...")
-    gcs_blob_map  = _build_gcs_blob_map(gcs_client)
-    print(f"  {len(gcs_blob_map)} documents indexed.\n")
+    print("Building document index...")
+    document_map  = _build_document_map()
+    print(f"  {len(document_map)} documents indexed.\n")
 
     for round_num in range(1, max_rounds + 1):
         plans = [_read_part(i) for i in range(total)]
@@ -776,7 +756,7 @@ def run_all(max_rounds: int = 5):
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             futures = {
                 pool.submit(
-                    _deep_pull_one, i, plans[i], gcs_blob_map, gemini_client, metadata
+                    _deep_pull_one, i, plans[i], document_map, gemini_client, metadata
                 ): i
                 for i in unanswered
             }
