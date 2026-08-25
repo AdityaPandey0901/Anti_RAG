@@ -19,10 +19,17 @@ Each one is runnable on its own. See its section below for setup and usage.
 
 ```
 .
-├── summarize_documents.py         # Stage 1 (root): GCS ingestion, extraction, summarisation
+├── run_agent.py                   # Unified entrypoint: pick an engine, point it at docs+questions
+├── core/
+│   └── sources.py                 # Source-agnostic document/question loading (local dir/CSV or GCS),
+│                                   #   shared by all four implementations below
+├── summarize_documents.py         # Stage 1 (root): ingestion, extraction, summarisation
 ├── plan_questions.py              # Stages 2–4 (root): planning, deep-research, orchestration
 ├── decrypt_and_store.py           # One-off utility: pulls a password-protected zip from GCS,
 │                                   #   decrypts it, re-uploads contents unzipped
+├── tests/                         # pytest suite (extraction, source loading, run_agent dispatch)
+│   └── fixtures/                  # small generated PDF/DOCX/XLSX + questions.csv used by tests
+│                                   #   and as a --docs/--questions demo for run_agent.py
 ├── Plan_Docs/                     # Generated: live research state for the root pipeline
 │   ├── metadata_store.csv
 │   └── question_plans.json
@@ -226,6 +233,27 @@ Same agentic idea as `pi-agent`, rebuilt on LangGraph's ReAct pattern with LangC
 
 ---
 
+## `run_agent.py` — unified entrypoint
+
+Pick an engine, point it at a document set and a question list — each either
+a local path or the existing GCS convention — and run it, without needing to
+know each implementation's individual CLI:
+
+```bash
+python run_agent.py --agent {sequential|parallel|pi-agent|langchain} \
+    --docs <local-folder-or-gs://bucket/prefix> \
+    --questions <path.csv-or-gs://bucket/questions.xlsx> \
+    [--ask "..."] [--state] [--report] [--quiet]   # pi-agent/langchain only
+```
+
+`--docs`/`--questions` override `DATA_PATH`/`QUESTIONS_PATH` from `.env` for
+that run only; omit them to fall back to whatever's already in `.env`. Under
+the hood this just resolves those two values and dispatches to the chosen
+engine's own entrypoint (`plan_questions.py --runAll`,
+`parallelized/plan_questions_parallelized.py --runAll`, `pi-agent/run.py`,
+`lang-chain-agent/run.py`) as a subprocess — each implementation's own CLI
+still works standalone exactly as documented below.
+
 ## Setup
 
 ### Prerequisites
@@ -270,6 +298,7 @@ Every implementation reads its own copy of these values from `.env` at the repo 
 | `python pi-agent/run.py` | Gemini function-calling agent, full autonomous run |
 | `python pi-agent/run.py --ask "..."` | Gemini agent, natural-language instruction |
 | `python lang-chain-agent/run.py` | LangGraph agent, full autonomous run |
+| `python run_agent.py --agent sequential --docs <path> --questions <path>` | Unified entrypoint — see below |
 
 ---
 
