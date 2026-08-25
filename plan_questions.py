@@ -30,7 +30,6 @@ from pathlib import Path
 
 import pandas as pd
 from dotenv import load_dotenv
-from google.cloud import storage
 from google import genai
 from google.genai import types
 
@@ -39,9 +38,9 @@ from summarize_documents import (
     extract_pdf_text,
     extract_docx_text,
     extract_excel_text,
-    BUCKET_NAME,
-    PREFIX,
+    DATA_PATH,
 )
+from core.sources import get_document_source, load_questions
 
 # ── Config ───────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -63,22 +62,9 @@ OUT_PATH   = Path(__file__).parent / "Plan_Docs/question_plans.json"
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def download_questions() -> list[str]:
-    """Download the questions Excel from GCS and return a flat list of question strings."""
-    client = storage.Client()
-    bucket = client.bucket(Q_BUCKET)
-    blob   = bucket.blob(Q_BLOB)
-    data   = blob.download_as_bytes()
-
-    xls = pd.ExcelFile(io.BytesIO(data), engine="openpyxl")
-    df  = xls.parse(xls.sheet_names[0])
-
-    # Prefer a column literally named "question(s)", otherwise take the first column
-    col = next(
-        (c for c in df.columns if str(c).strip().lower() in ("question", "questions")),
-        df.columns[0],
-    )
-    questions = df[col].dropna().astype(str).str.strip().tolist()
-    print(f"  Loaded {len(questions)} questions from column '{col}'.")
+    """Load the questions list (local .csv/.xlsx or GCS .xlsx, per QUESTIONS_PATH)."""
+    questions = load_questions(QUESTIONS_PATH)
+    print(f"  Loaded {len(questions)} questions.")
     return questions
 
 
@@ -149,15 +135,9 @@ _NATIVE_MIME = {
 }
 
 
-def _build_gcs_blob_map(gcs_client) -> dict[str, object]:
-    """Return {filename: blob} for every file under DATA_PATH in GCS."""
-    bucket = gcs_client.bucket(BUCKET_NAME)
-    blobs  = bucket.list_blobs(prefix=PREFIX)
-    result = {}
-    for b in blobs:
-        if not b.name.endswith("/"):
-            result[Path(b.name).name] = b
-    return result
+def _build_document_map() -> dict[str, object]:
+    """Return {filename: ref} for every document under DATA_PATH (local dir or GCS)."""
+    return get_document_source(DATA_PATH).list_documents()
 
 
 def _query_document(gemini_client, doc_name: str, blob_bytes: bytes,
@@ -362,7 +342,7 @@ def _answer_directly_from_doc(gemini_client, doc_name: str,
 
 def goDeep(question_number: int,
            plans: list[dict]=None,
-           gcs_blob_map: dict=None ,
+           document_map: dict=None ,
            gemini_client=None) -> str:
     """
     Perform deep research for a single question (1-indexed).
@@ -389,10 +369,9 @@ def goDeep(question_number: int,
     # ── Lazy-init shared objects ─────────────────────────────────────────────
     if gemini_client is None:
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    gcs_client = storage.Client()
-    if gcs_blob_map is None:
-        print("    Building GCS blob index...")
-        gcs_blob_map = _build_gcs_blob_map(gcs_client)
+    if document_map is None:
+        print("    Building document index...")
+        document_map = _build_document_map()
 
     question     = entry.get("question", "")
     answer_found = entry.get("answer_found")
@@ -472,7 +451,7 @@ def goDeep(question_number: int,
 
         print(f"    [{i+1}/{len(plan)}] Querying: {doc_name} ...", end=" ", flush=True)
 
-        blob = gcs_blob_map.get(doc_name)
+        blob = document_map.get(doc_name)
         if blob is None:
             result = f"NOT FOUND IN GCS: {doc_name}"
             print("NOT IN BUCKET")
@@ -519,7 +498,7 @@ def goDeep(question_number: int,
         direct_answers = []
         for plan_item in plan:
             doc_name = next(iter(plan_item))
-            blob     = gcs_blob_map.get(doc_name)
+            blob     = document_map.get(doc_name)
             if blob is None:
                 direct_answers.append(f"NOT IN BUCKET: {doc_name}")
                 continue
@@ -565,10 +544,9 @@ def run_deep_dive():
     print(f"Starting deep dive on {len(plans)} question(s)...\n")
 
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    gcs_client    = storage.Client()
-    print("Building GCS blob index...")
-    gcs_blob_map  = _build_gcs_blob_map(gcs_client)
-    print(f"  {len(gcs_blob_map)} documents indexed.\n")
+    print("Building document index...")
+    document_map  = _build_document_map()
+    print(f"  {len(document_map)} documents indexed.\n")
 
     for i, _ in enumerate(plans):
         q_num = i + 1
@@ -576,7 +554,7 @@ def run_deep_dive():
         result_json = goDeep(
             question_number=q_num,
             plans=plans,
-            gcs_blob_map=gcs_blob_map,
+            document_map=document_map,
             gemini_client=gemini_client,
         )
         # plans is modified in-place by goDeep; reload the serialised result
@@ -594,7 +572,7 @@ def main():
     metadata = get_metadata_store()
     print(f"  {len(metadata)} documents in metadata store.")
 
-    print("Downloading questions from GCS...")
+    print("Loading questions...")
     questions = download_questions()
 
     print(f"Sending {len(questions)} questions to Gemini for planning (single call)...")
@@ -672,10 +650,9 @@ def run_all(max_rounds: int = 5):
 
     # ── Step 3: Deep-dive loop ───────────────────────────────────────────────
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    gcs_client    = storage.Client()
-    print("Building GCS blob index...")
-    gcs_blob_map  = _build_gcs_blob_map(gcs_client)
-    print(f"  {len(gcs_blob_map)} documents indexed.\n")
+    print("Building document index...")
+    document_map  = _build_document_map()
+    print(f"  {len(document_map)} documents indexed.\n")
 
     for round_num in range(1, max_rounds + 1):
         # Re-read plans from disk so each round picks up any mutations
@@ -696,7 +673,7 @@ def run_all(max_rounds: int = 5):
             result_json = goDeep(
                 question_number=q_num,
                 plans=plans,
-                gcs_blob_map=gcs_blob_map,
+                document_map=document_map,
                 gemini_client=gemini_client,
             )
             plans[i] = json.loads(result_json)

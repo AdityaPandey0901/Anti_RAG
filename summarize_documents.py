@@ -28,8 +28,9 @@ import pytesseract
 from PIL import Image
 from docx import Document as DocxDocument
 from dotenv import load_dotenv
-from google.cloud import storage
 from google import genai
+
+from core.sources import get_document_source
 
 # ── Configuration ────────────────────────────────────────────────────────────
 load_dotenv()
@@ -185,21 +186,14 @@ def get_metadata_store() -> list[dict]:
 def main():
     # Init
     conn = init_db()
-    gcs_client = storage.Client()
-    bucket = gcs_client.bucket(BUCKET_NAME)
+    document_source = get_document_source(DATA_PATH)
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-    blobs = list(bucket.list_blobs(prefix=PREFIX))
-    print(f"Found {len(blobs)} objects under gs://{BUCKET_NAME}/{PREFIX}")
+    docs = document_source.list_documents()
+    print(f"Found {len(docs)} objects under {DATA_PATH}")
 
-    for blob in blobs:
-        name = blob.name
-        # Skip "folders" (zero-byte directory markers)
-        if name.endswith("/"):
-            continue
-
-        ext = Path(name).suffix.lower()
-        doc_name = Path(name).name  # just the filename
+    for doc_name, ref in docs.items():
+        ext = Path(doc_name).suffix.lower()
 
         if ext not in SUPPORTED_EXTENSIONS:
             print(f"  SKIP (unsupported): {doc_name}")
@@ -216,7 +210,7 @@ def main():
         print(f"  Processing: {doc_name} ...", end=" ", flush=True)
 
         # Download
-        blob_bytes = blob.download_as_bytes()
+        blob_bytes = ref.download_as_bytes()
 
         # Extract
         try:
